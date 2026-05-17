@@ -21,19 +21,6 @@ SENTIMIENTO (modelo de clasificación)
 import hashlib
 import csv
 from datetime import datetime
-
-# ── Modelo BERT fine-tuned (INTEGRADO REPO AD9394I) ──────────────────────────
-# Tu modelo entrenado con el dataset de 30k balanceado
-HF_SENTIMENT_MODEL = "ad9394i/youtube-sentiment-roberta"  
-
-# Importar transformers solo si hay modelo configurado (evita peso en arranque)
-_BERT_AVAILABLE = False
-if HF_SENTIMENT_MODEL:
-    try:
-        from transformers import pipeline as hf_pipeline
-        _BERT_AVAILABLE = True
-    except ImportError:
-        pass
 import os
 import re
 from difflib import SequenceMatcher
@@ -63,8 +50,19 @@ from sklearn.model_selection import train_test_split
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import MaxAbsScaler
 from sklearn.decomposition import NMF
-from sklearn.feature_extraction.text import CountVectorizer
 from wordcloud import STOPWORDS, WordCloud
+
+# ── Modelo BERT fine-tuned (INTEGRADO REPO AD9394I) ──────────────────────────
+HF_SENTIMENT_MODEL = "ad9394i/youtube-sentiment-roberta"  
+
+# Importar transformers solo si hay modelo configurado (evita peso en arranque)
+_BERT_AVAILABLE = False
+if HF_SENTIMENT_MODEL:
+    try:
+        from transformers import pipeline as hf_pipeline
+        _BERT_AVAILABLE = True
+    except ImportError:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -111,7 +109,7 @@ EMOJI_UNICODE_RE = re.compile(r"[🌀-🿿]")
 
 
 # ─────────────────────────────────────────────────────────────────
-# FEATURES MANUALES PARA SPAM — 14 señales (v8.5, antes 9)
+# FEATURES MANUALES PARA SPAM — 14 señales
 # ─────────────────────────────────────────────────────────────────
 class SpamFeatures(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None): return self
@@ -144,7 +142,7 @@ class SpamFeatures(BaseEstimator, TransformerMixin):
 
 
 # ─────────────────────────────────────────────────────────────────
-# FEATURES MANUALES PARA SENTIMIENTO — 15 señales (v8.6)
+# FEATURES MANUALES PARA SENTIMIENTO — 15 señales
 # ─────────────────────────────────────────────────────────────────
 NEGATION_WORDS = {
     "not","no","never","nothing","nobody","nowhere","neither","nor",
@@ -174,7 +172,6 @@ _CAPS_WORD    = re.compile(r"\b[A-Z]{3,}\b")
 _EMOJI_UNI    = re.compile("[\U0001F300-\U0001FFFF]")
 
 class SentimentFeatures(BaseEstimator, TransformerMixin):
-    """15 señales handcrafted de sentimiento."""
     def fit(self, X, y=None): return self
     def transform(self, X): return np.array([self._f(t) for t in X], dtype=float)
     def _f(self, text: str) -> list:
@@ -204,7 +201,6 @@ class SentimentFeatures(BaseEstimator, TransformerMixin):
 # RGPD — SEUDONIMIZACIÓN (Art. 25)
 # ─────────────────────────────────────────────────────────────────
 def seudonimizar(nombre: str) -> str:
-    """SHA-256 del nombre real → 'Usr-XXXXXXXX'. Irreversible sin la clave."""
     d = hashlib.sha256(str(nombre).encode("utf-8")).hexdigest()[:8].upper()
     return f"Usr-{d}"
 
@@ -307,7 +303,7 @@ def cargar_datos_sentimiento(ratio_por_clase: int = 1) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────
-# ENTRENAMIENTO — SPAM (LR + word + char n-grams + handcrafted)
+# ENTRENAMIENTO — SPAM (LR + SVC Ensemble)
 # ─────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def entrenar_spam(df: pd.DataFrame):
@@ -585,11 +581,14 @@ def analizar(texto: str, spam_pipe, sent_pipe, batch_spam: bool = False) -> dict
             spam, spam_conf, motivo = int(rd), rd_c, "regla" if rd else ""
         else:
             probas = spam_pipe.predict_proba([texto])[0]
-            clases = spam_pipe.named_steps["clf"].classes_
+            
+            # --- CORRECCIÓN CLAVE AQUÍ PARA EL VOTING CLASSIFIER ---
+            clases = spam_pipe.classes_  
             idx_spam = int(np.where(clases == 1)[0][0]) if 1 in clases else 1
             spam = int(spam_pipe.predict([texto])[0])
             spam_conf = float(probas[idx_spam]) * 100
-            motivo = "LR" if spam else ""
+            motivo = "Ensemble LR+SVC" if spam else ""
+            # -------------------------------------------------------
 
     limpio = preprocesar(texto)
     texto_sent = limpio if limpio else texto
@@ -646,7 +645,7 @@ def plot_cm(cm, labels, title):
 
 
 # ─────────────────────────────────────────────────────────────────
-# FEEDBACK HUMANO COMPLETO RESTAURADO
+# FEEDBACK HUMANO COMPLETO
 # ─────────────────────────────────────────────────────────────────
 def _feedback_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), FEEDBACK_CSV)
@@ -733,7 +732,7 @@ def mostrar_panel_feedback() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────
-# COMPONENTES VISUALES RESTAURADOS
+# COMPONENTES VISUALES
 # ─────────────────────────────────────────────────────────────────
 def grafico_sentimiento(df_res: pd.DataFrame):
     return px.pie(df_res, names="Sentimiento", title="Distribución de sentimiento", hole=0.35, color="Sentimiento", color_discrete_map={"Positive": "#2ecc71", "Negative": "#e74c3c", "Neutral":  "#95a5a6"})
@@ -792,7 +791,7 @@ _FEEDBACK_COLS = ["timestamp", "texto_hash", "texto", "pred_spam", "pred_sentimi
 
 
 # ─────────────────────────────────────────────────────────────────
-# INTERFAZ PRINCIPAL COMPLETAMENTE RESTAURADA (v9.0)
+# INTERFAZ PRINCIPAL (v9.0)
 # ─────────────────────────────────────────────────────────────────
 def main():
     st.title("🎬 YouTube Spam & Sentiment Detector")
@@ -837,7 +836,6 @@ def main():
         st.metric("F1 macro (sent)", f"{m_sent['f1_macro']:.3f}")
         st.divider()
 
-    # TABS Y PESTAÑAS INTEGRALES RESTAURADAS 
     if opcion == "🔎 Análisis manual":
         st.header("🔎 Análisis manual")
         texto = st.text_area("Comentario a analizar:", height=110)
@@ -866,17 +864,43 @@ def main():
 
     elif opcion == "🎬 Auditoría en tiempo real":
         st.header("🎬 Auditoría en tiempo real")
-        url = st.text_input("URL del vídeo:")
+        
+        # --- CORRECCIÓN CLAVE: API KEY UI ---
+        api_key = st.text_input("🔑 Tu YouTube API Key:", type="password", help="Necesaria para descargar los comentarios directamente desde Youtube.")
+        num_api = st.slider("Número de comentarios a descargar y analizar:", min_value=20, max_value=500, value=100, step=20)
+        st.divider()
+        # ------------------------------------
+        
+        url = st.text_input("URL del vídeo de YouTube:")
         if st.button("🚀 Analizar vídeo", type="primary"):
+            if not api_key.strip():
+                st.warning("⚠️ Por favor, introduce tu API Key de YouTube arriba para poder continuar.")
+                return
+            
             v_id = extraer_video_id(url)
-            if not v_id: st.error("ID Inválido."); return
-            comentarios = descargar_comentarios(api_key, v_id, num_api)
-            df_filas = pd.DataFrame(analizar_batch(comentarios, spam_pipe, sent_pipe))
-            st.session_state["df_resultados_temas"] = df_filas; mostrar_resultados(df_filas)
+            if not v_id: 
+                st.error("ID Inválido. Asegúrate de poner un enlace correcto de YouTube.")
+                return
+            
+            with st.spinner("Descargando comentarios de YouTube..."):
+                try:
+                    comentarios = descargar_comentarios(api_key, v_id, num_api)
+                except Exception as e:
+                    st.error(f"Error al descargar comentarios: {str(e)}")
+                    return
+                
+            if not comentarios:
+                st.warning("No se encontraron comentarios, los comentarios están desactivados, o la API Key es incorrecta.")
+                return
+            
+            with st.spinner("Analizando spam y sentimiento..."):
+                df_filas = pd.DataFrame(analizar_batch(comentarios, spam_pipe, sent_pipe))
+                st.session_state["df_resultados_temas"] = df_filas
+                mostrar_resultados(df_filas)
 
     elif opcion == "📊 Rendimiento de los modelos":
         st.header("📊 Rendimiento de los modelos")
-        tab_spam, tab_sent = st.tabs(["🛡️ Spam (LR)", "💬 Sentimiento (LR)"])
+        tab_spam, tab_sent = st.tabs(["🛡️ Spam (LR+SVC)   ", "💬 Sentimiento (LR)"])
         with tab_spam:
             st.markdown(f"Entrenado con **{m_spam['n_train']:,}** muestras. Holdout 20%.")
             c1, c2, c3, c4 = st.columns(4)
@@ -922,7 +946,6 @@ def main():
                 with st.spinner("Analizando…"):
                     resultados = [analizar(c, spam_pipe, sent_pipe) for c in lineas]
                 
-                # BUGFIX COMPLETADO AQUÍ -> Garantiza que no ocurra KeyError
                 df_man = pd.DataFrame({
                     "Comentario": lineas,
                     "Sentimiento": [r["sentimiento"] for r in resultados],
