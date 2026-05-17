@@ -1,7 +1,10 @@
-streamlit
-pandas
-scikit-learn
-google-api-python-client
-wordcloud
-plotly
-matplotlib
+﻿streamlit>=1.35.0
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+plotly>=5.20.0
+matplotlib>=3.8.0
+wordcloud>=1.9.3
+google-api-python-client>=2.120.0
+transformers>=4.40.0
+torch>=2.2.0

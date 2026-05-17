@@ -29,6 +29,21 @@ YouTube ToS
 """
 
 import hashlib
+import csv
+
+# ── Modelo BERT fine-tuned (opcional) ────────────────────────────────────────
+# Pon aquí el nombre de tu repo de HuggingFace tras el fine-tuning.
+# Si está vacío o el modelo no carga, la app usa el modelo sklearn de siempre.
+HF_SENTIMENT_MODEL = ""   # Ejemplo: "tu-usuario/youtube-sentiment-distilbert"
+
+# Importar transformers solo si hay modelo configurado (evita peso en arranque)
+_BERT_AVAILABLE = False
+if HF_SENTIMENT_MODEL:
+    try:
+        from transformers import pipeline as hf_pipeline
+        _BERT_AVAILABLE = True
+    except ImportError:
+        pass
 import os
 import re
 from difflib import SequenceMatcher
@@ -57,6 +72,8 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import FeatureUnion, Pipeline
 from sklearn.preprocessing import MaxAbsScaler
+from sklearn.decomposition import NMF
+from sklearn.feature_extraction.text import CountVectorizer
 from wordcloud import STOPWORDS, WordCloud
 
 
@@ -430,6 +447,47 @@ def entrenar_spam(df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────────
+# INFERENCIA BERT (si HF_SENTIMENT_MODEL está configurado)
+# ─────────────────────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def _cargar_bert_sentimiento():
+    """Carga el modelo fine-tuned desde HuggingFace Hub (una sola vez)."""
+    if not _BERT_AVAILABLE or not HF_SENTIMENT_MODEL:
+        return None
+    try:
+        return hf_pipeline(
+            "text-classification",
+            model=HF_SENTIMENT_MODEL,
+            truncation=True,
+            max_length=128,
+            device=-1,          # CPU; cambia a 0 si tienes GPU en el servidor
+        )
+    except Exception as e:
+        st.warning(f"⚠️ No se pudo cargar el modelo BERT: {e}. Usando sklearn.")
+        return None
+
+
+def predecir_sentimiento(texto: str, sent_pipe_sklearn) -> tuple[str, float]:
+    """
+    Devuelve (etiqueta, confianza).
+    Usa BERT si está disponible, sklearn si no.
+    """
+    bert = _cargar_bert_sentimiento()
+    if bert is not None:
+        try:
+            res = bert(texto[:512])[0]
+            # HF devuelve la etiqueta tal como la definiste en id2label
+            label = res["label"].lower()
+            return label, round(res["score"] * 100, 1)
+        except Exception:
+            pass  # fallback a sklearn
+    # ── Fallback sklearn ──────────────────────────────────────────
+    pred  = sent_pipe_sklearn.predict([texto])[0]
+    proba = sent_pipe_sklearn.predict_proba([texto])[0].max()
+    return pred, round(float(proba) * 100, 1)
+
+
+# ─────────────────────────────────────────────────────────────────
 # ENTRENAMIENTO — SENTIMIENTO (LR multiclase)
 # ─────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
@@ -477,6 +535,231 @@ def entrenar_sentimiento(df: pd.DataFrame):
         "n_train":     len(X_tr),
     }
     return pipeline, metricas
+
+
+
+# ─────────────────────────────────────────────────────────────────
+# ANÁLISIS DE TEMAS (NMF sobre TF-IDF)
+# ─────────────────────────────────────────────────────────────────
+_EXTRA_STOP = {
+    "video","channel","like","just","know","good","really","get","one",
+    "make","people","think","want","watch","see","time","go","come",
+    "youtube","comment","subscribe","share","pleas","please","thank","thanks",
+    "hi","hello","hey","great","nice","love","best","sir","also","even",
+    "will","can","don","doesn","didn","isn","aren","wasn","weren",
+    "say","said","need","got","going","still","way","thing","things",
+}
+
+_CLEAN_RE = re.compile(r"https?://\S+|www\.\S+|[^a-z\s']")
+
+def _limpiar_texto_temas(texto: str) -> str:
+    t = str(texto).lower()
+    t = _CLEAN_RE.sub(" ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def extraer_temas(
+    comentarios: list[str],
+    n_temas: int = 4,
+    n_palabras: int = 8,
+    ngram_max: int = 2,
+) -> list[dict]:
+    """
+    Extrae temas con NMF + TF-IDF.
+    Devuelve lista de dicts {id, palabras, peso_medio}.
+    NMF produce temas más nítidos que LDA en textos cortos (comentarios YouTube).
+    """
+    if len(comentarios) < 20:
+        return []
+
+    limpios = [_limpiar_texto_temas(c) for c in comentarios]
+    limpios = [t for t in limpios if len(t.split()) >= 3]
+    if len(limpios) < 20:
+        return []
+
+    vec = TfidfVectorizer(
+        max_df=0.80, min_df=max(3, len(limpios)//200),
+        max_features=2500,
+        stop_words="english",
+        ngram_range=(1, ngram_max),
+        token_pattern=r"(?u)\b[a-z]{3,}\b",
+    )
+    try:
+        dtm = vec.fit_transform(limpios)
+    except ValueError:
+        return []
+
+    words = vec.get_feature_names_out()
+    # Eliminar stop words adicionales del vocabulario
+    keep_idx = [i for i, w in enumerate(words)
+                if not any(s == w or w.startswith(s + " ") or w.endswith(" " + s)
+                           for s in _EXTRA_STOP)]
+    if len(keep_idx) < n_palabras * 2:
+        keep_idx = list(range(len(words)))     # fallback sin filtro extra
+
+    dtm_f = dtm[:, keep_idx]
+    words_f = words[keep_idx]
+
+    n_comp = min(n_temas, dtm_f.shape[1], dtm_f.shape[0] - 1)
+    if n_comp < 1:
+        return []
+
+    nmf = NMF(n_components=n_comp, random_state=42, max_iter=300,
+              init="nndsvda", l1_ratio=0.1)
+    W = nmf.fit_transform(dtm_f)   # doc-topic matrix
+
+    temas = []
+    for i, comp in enumerate(nmf.components_):
+        top_idx  = comp.argsort()[-n_palabras:][::-1]
+        palabras = [words_f[j] for j in top_idx]
+        pesos    = [float(comp[j]) for j in top_idx]
+        peso_doc = float(W[:, i].mean())        # relevancia media del tema
+        temas.append({
+            "id":       i + 1,
+            "palabras": palabras,
+            "pesos":    pesos,
+            "relevancia": peso_doc,
+        })
+
+    # Ordenar por relevancia descendente
+    temas.sort(key=lambda x: x["relevancia"], reverse=True)
+    return temas
+
+
+def _color_tema(i: int) -> str:
+    """Paleta de colores para los temas (Plotly)."""
+    paleta = ["#534AB7","#1D9E75","#D85A30","#378ADD","#D4537E"]
+    return paleta[i % len(paleta)]
+
+
+def mostrar_analisis_temas(df_res: pd.DataFrame) -> None:
+    """
+    Renderiza la pestaña completa de análisis de temas.
+    df_res debe tener columnas 'Comentario', 'Sentimiento', 'Spam'.
+    """
+    import plotly.graph_objects as go
+
+    st.subheader("🧩 Análisis de temas por sentimiento")
+    st.caption(
+        "Algoritmo NMF sobre TF-IDF bigramas — extrae los temas latentes que "
+        "dominan los comentarios de cada grupo de sentimiento."
+    )
+
+    # Filtrar spam
+    df_clean = df_res[df_res.get("Spam", pd.Series(["No"]*len(df_res))) != "SÍ"].copy()
+    if df_clean.empty or "Sentimiento" not in df_clean.columns:
+        st.info("No hay suficientes comentarios analizados para extraer temas.")
+        return
+
+    # ── Controles ────────────────────────────────────────────────────
+    col_ctrl1, col_ctrl2, col_ctrl3 = st.columns(3)
+    n_temas   = col_ctrl1.slider("Número de temas", 2, 6, 4)
+    n_palabras= col_ctrl2.slider("Palabras por tema", 5, 12, 8)
+    solo_ing  = col_ctrl3.checkbox("Solo comentarios en inglés", value=False,
+                                    help="Filtra por la columna 'Idioma' si existe. "
+                                         "Los temas son más nítidos en un solo idioma.")
+
+    if solo_ing and "Idioma" in df_clean.columns:
+        df_clean = df_clean[df_clean["Idioma"].str.lower().str.startswith("en", na=False)]
+
+    sentimientos = ["Positive", "Negative", "Neutral"]
+    colores_sent = {"Positive": "success", "Negative": "danger", "Neutral": "info"}
+    emoji_sent   = {"Positive": "🟢", "Negative": "🔴", "Neutral": "⚪"}
+
+    tabs = st.tabs([f"{emoji_sent[s]} {s}" for s in sentimientos])
+
+    for tab, sent in zip(tabs, sentimientos):
+        with tab:
+            subset = df_clean[df_clean["Sentimiento"] == sent]["Comentario"].tolist()
+
+            if len(subset) < 20:
+                st.info(f"Solo {len(subset)} comentarios {sent.lower()} — mínimo 20 para extraer temas.")
+                continue
+
+            with st.spinner(f"Extrayendo temas de {len(subset):,} comentarios {sent.lower()}…"):
+                temas = extraer_temas(
+                    tuple(subset),          # hashable para cache
+                    n_temas=n_temas,
+                    n_palabras=n_palabras,
+                )
+
+            if not temas:
+                st.warning("No se pudieron extraer temas significativos de este grupo.")
+                continue
+
+            st.markdown(f"**{len(subset):,}** comentarios analizados · **{len(temas)}** temas encontrados")
+            st.divider()
+
+            for tema in temas:
+                i       = tema["id"] - 1
+                color   = _color_tema(i)
+                palabras= tema["palabras"]
+                pesos   = tema["pesos"]
+                rel     = tema["relevancia"]
+
+                # Cabecera del tema
+                st.markdown(
+                    f'<span style="display:inline-block;background:{color}18;'
+                    f'color:{color};border:1px solid {color}40;'
+                    f'border-radius:6px;padding:3px 10px;font-size:13px;font-weight:500;">'
+                    f'Tema {tema["id"]}</span>'
+                    f'<span style="color:var(--color-text-secondary);font-size:12px;margin-left:8px;">'
+                    f'relevancia media {rel:.4f}</span>',
+                    unsafe_allow_html=True,
+                )
+
+                # Gráfico de barras horizontal (palabras del tema)
+                fig = go.Figure(go.Bar(
+                    x=pesos[::-1],
+                    y=palabras[::-1],
+                    orientation="h",
+                    marker_color=color,
+                    marker_opacity=0.85,
+                    hovertemplate="%{y}: %{x:.4f}<extra></extra>",
+                ))
+                fig.update_layout(
+                    height=max(180, len(palabras) * 28),
+                    margin=dict(l=0, r=20, t=8, b=8),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                    yaxis=dict(showgrid=False, tickfont=dict(size=13)),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"tema_{sent}_{i}")
+
+                # Pills de palabras clave
+                pills_html = " ".join(
+                    f'<span style="background:{color}18;color:{color};'
+                    f'border:1px solid {color}40;border-radius:20px;'
+                    f'padding:2px 10px;font-size:12px;margin:2px;display:inline-block;">'
+                    f'{p}</span>'
+                    for p in palabras
+                )
+                st.markdown(pills_html, unsafe_allow_html=True)
+                st.markdown("---")
+
+            # Resumen comparativo de temas (radar / heat)
+            with st.expander("Ver relevancia comparativa de todos los temas", expanded=False):
+                labels = [f"Tema {t['id']}: {t['palabras'][0]}" for t in temas]
+                valores = [t["relevancia"] for t in temas]
+                colores = [_color_tema(t["id"]-1) for t in temas]
+                fig2 = go.Figure(go.Bar(
+                    x=labels, y=valores,
+                    marker_color=colores,
+                    hovertemplate="%{x}<br>Relevancia: %{y:.4f}<extra></extra>",
+                ))
+                fig2.update_layout(
+                    height=260,
+                    margin=dict(l=0, r=0, t=12, b=40),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(showgrid=False),
+                    yaxis=dict(showgrid=True, gridcolor="rgba(128,128,128,0.15)",
+                               zeroline=False, showticklabels=False),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig2, use_container_width=True, key=f"resumen_{sent}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -556,11 +839,11 @@ def analizar(texto: str, spam_pipe, sent_pipe, batch_spam: bool = False) -> dict
             spam_conf = float(probas[idx_spam]) * 100
             motivo   = "LR" if spam else ""
 
-    # — SENTIMIENTO —
-    limpio     = preprocesar(texto)
-    sent_raw   = sent_pipe.predict([limpio] if limpio else [texto])[0]
-    sent_conf  = float(sent_pipe.predict_proba([limpio] if limpio else [texto])[0].max()) * 100
-    label_map  = {"positive": "Positive", "neutral": "Neutral", "negative": "Negative"}
+    # — SENTIMIENTO (BERT si HF_SENTIMENT_MODEL configurado, sklearn si no) —
+    limpio      = preprocesar(texto)
+    texto_sent  = limpio if limpio else texto
+    sent_raw, sent_conf = predecir_sentimiento(texto_sent, sent_pipe)
+    label_map   = {"positive": "Positive", "neutral": "Neutral", "negative": "Negative"}
     sentimiento = label_map.get(sent_raw, sent_raw.capitalize())
 
     return {
@@ -631,6 +914,224 @@ def plot_cm(cm, labels, title):
     plt.tight_layout()
     return fig
 
+# ─────────────────────────────────────────────────────────────────
+# FEEDBACK HUMANO — guardar, leer, resetear
+# ─────────────────────────────────────────────────────────────────
+
+def _feedback_path() -> str:
+    """Devuelve la ruta absoluta del CSV de feedback."""
+    import os
+    base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, FEEDBACK_CSV)
+
+
+def guardar_feedback(
+    texto: str,
+    pred_spam: str,
+    pred_sent: str,
+    correcto_spam: str,
+    correcto_sent: str,
+    nota: str = "",
+) -> None:
+    """Añade una fila al CSV de correcciones (crea el fichero si no existe)."""
+    import os
+    path = _feedback_path()
+    nuevo = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=_FEEDBACK_COLS)
+        if nuevo:
+            w.writeheader()
+        w.writerow({
+            "timestamp":          datetime.utcnow().isoformat(timespec="seconds"),
+            "texto_hash":         hashlib.sha256(texto.encode()).hexdigest()[:12],
+            "texto":              texto[:500],          # truncar por privacidad
+            "pred_spam":          pred_spam,
+            "pred_sentimiento":   pred_sent,
+            "correcto_spam":      correcto_spam,
+            "correcto_sentimiento": correcto_sent,
+            "nota":               nota[:200],
+        })
+
+
+def leer_feedback() -> pd.DataFrame:
+    """Carga el CSV de feedback; devuelve DataFrame vacío si no existe."""
+    import os
+    path = _feedback_path()
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=_FEEDBACK_COLS)
+    try:
+        return pd.read_csv(path, encoding="utf-8")
+    except Exception:
+        return pd.DataFrame(columns=_FEEDBACK_COLS)
+
+
+def _feedback_key(idx: int, campo: str) -> str:
+    """Clave única de widget para evitar colisiones entre filas."""
+    return f"fb_{campo}_{idx}"
+
+
+def widget_feedback_fila(
+    idx: int,
+    texto: str,
+    pred_spam: str,
+    pred_sent: str,
+) -> None:
+    """
+    Renderiza el formulario de feedback para UNA fila de la tabla de resultados.
+    Se llama desde mostrar_resultados() dentro de un st.expander().
+    """
+    opciones_spam = ["— sin cambio —", "✅ NO es spam", "🚨 SÍ es spam"]
+    opciones_sent = ["— sin cambio —", "Positive", "Neutral", "Negative"]
+
+    c1, c2 = st.columns(2)
+    spam_correc = c1.selectbox(
+        "¿Spam correcto?", opciones_spam,
+        key=_feedback_key(idx, "spam"),
+    )
+    sent_correc = c2.selectbox(
+        "¿Sentimiento correcto?", opciones_sent,
+        key=_feedback_key(idx, "sent"),
+    )
+    nota = st.text_input(
+        "Nota opcional (¿por qué se equivocó?)",
+        key=_feedback_key(idx, "nota"),
+        placeholder="p.ej. sarcasmo, mezcla de idiomas, modismo...",
+    )
+
+    if st.button("💾 Guardar corrección", key=_feedback_key(idx, "btn")):
+        cs = spam_correc if spam_correc != "— sin cambio —" else pred_spam
+        cv = sent_correc if sent_correc != "— sin cambio —" else pred_sent
+        guardar_feedback(texto, pred_spam, pred_sent, cs, cv, nota)
+        st.success("Corrección guardada ✅")
+        # Invalidar caché de estadísticas
+        st.session_state["fb_stats_stale"] = True
+
+
+def mostrar_panel_feedback() -> None:
+    """
+    Pestaña completa de gestión del feedback acumulado:
+    estadísticas, tabla, descarga y opción de reset.
+    """
+    st.header("🗂️ Feedback acumulado")
+
+    df_fb = leer_feedback()
+
+    if df_fb.empty:
+        st.info(
+            "Todavía no hay correcciones guardadas. "
+            "Ve a cualquier análisis, expande una fila y marca si el modelo se equivocó."
+        )
+        return
+
+    # ── Métricas rápidas ──────────────────────────────────────────
+    n_total   = len(df_fb)
+    n_spam_wrong = ((df_fb["pred_spam"] != df_fb["correcto_spam"]) &
+                    (df_fb["correcto_spam"] != df_fb["pred_spam"])).sum()
+    n_sent_wrong = ((df_fb["pred_sentimiento"] != df_fb["correcto_sentimiento"]) &
+                    (df_fb["correcto_sentimiento"] != df_fb["pred_sentimiento"])).sum()
+    # Filas donde al menos un campo fue corregido
+    n_errors = ((df_fb["pred_spam"]          != df_fb["correcto_spam"]) |
+                (df_fb["pred_sentimiento"]    != df_fb["correcto_sentimiento"])).sum()
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Feedbacks totales",   n_total)
+    k2.metric("Errores detectados",  n_errors,
+              help="Filas donde la predicción difiere de la corrección humana")
+    k3.metric("Errores spam",        n_spam_wrong)
+    k4.metric("Errores sentimiento", n_sent_wrong)
+
+    if n_total > 0:
+        tasa = n_errors / n_total * 100
+        color = "🔴" if tasa > 20 else "🟡" if tasa > 10 else "🟢"
+        st.markdown(
+            f"{color} **Tasa de error percibida por el usuario:** "
+            f"`{tasa:.1f}%` — basada en {n_total} evaluaciones humanas"
+        )
+
+    st.divider()
+
+    # ── Errores más frecuentes ────────────────────────────────────
+    df_err = df_fb[
+        (df_fb["pred_spam"] != df_fb["correcto_spam"]) |
+        (df_fb["pred_sentimiento"] != df_fb["correcto_sentimiento"])
+    ].copy()
+
+    if not df_err.empty:
+        st.subheader("Correcciones guardadas")
+        df_err["tipo_error"] = df_err.apply(
+            lambda r: (
+                "Spam + Sentimiento"
+                if r["pred_spam"] != r["correcto_spam"] and r["pred_sentimiento"] != r["correcto_sentimiento"]
+                else "Solo spam" if r["pred_spam"] != r["correcto_spam"]
+                else "Solo sentimiento"
+            ), axis=1
+        )
+        tipo_counts = df_err["tipo_error"].value_counts().reset_index()
+        tipo_counts.columns = ["Tipo de error", "Nº correcciones"]
+        st.dataframe(tipo_counts, use_container_width=True, hide_index=True)
+
+        st.subheader("Textos corregidos")
+        cols_show = ["timestamp","texto","pred_spam","correcto_spam",
+                     "pred_sentimiento","correcto_sentimiento","nota"]
+        st.dataframe(df_err[cols_show], use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Descargar para reentrenar ─────────────────────────────────
+    st.subheader("Exportar para reentrenar")
+    st.markdown(
+        "El CSV exportado contiene el texto y la **etiqueta corregida por el humano**. "
+        "Úsalo como dataset adicional en `cargar_datos_spam()` / "
+        "`cargar_datos_sentimiento()` para incorporar los errores al reentrenamiento."
+    )
+    col_dl, col_rst = st.columns([3, 1])
+
+    # Dataset de correcciones listo para añadir al pipeline
+    df_export = df_fb.rename(columns={
+        "texto":              "text",
+        "correcto_spam":      "spam_label",
+        "correcto_sentimiento": "sentiment_label",
+    })[["timestamp","texto_hash","text","spam_label","sentiment_label","nota"]]
+
+    col_dl.download_button(
+        "📥 Descargar dataset de correcciones",
+        data=df_export.to_csv(index=False).encode("utf-8"),
+        file_name="feedback_correcciones_entrenamiento.csv",
+        mime="text/csv",
+        type="primary",
+    )
+
+    with col_rst:
+        if st.button("🗑️ Resetear feedback", help="Borra todas las correcciones guardadas"):
+            import os
+            path = _feedback_path()
+            if os.path.exists(path):
+                os.remove(path)
+            st.session_state.pop("fb_stats_stale", None)
+            st.success("Feedback borrado.")
+            st.rerun()
+
+    # ── Notas de reentrenamiento ──────────────────────────────────
+    with st.expander("📖 Cómo usar este CSV para mejorar el modelo"):
+        st.markdown("""
+**Para spam** — añade el fichero como fuente 5 en `cargar_datos_spam()`:
+```python
+if os.path.exists("feedback_correcciones_entrenamiento.csv"):
+    df_fb = pd.read_csv("feedback_correcciones_entrenamiento.csv")
+    df_fb = df_fb[["text","spam_label"]].dropna()
+    df_fb.columns = ["text", "spam"]
+    df_fb["spam"] = (df_fb["spam"].str.contains("SÍ|spam", case=False)).astype(int)
+    partes.append(df_fb)
+```
+**Para sentimiento** — igual en `cargar_datos_sentimiento()`:
+```python
+df_fb["sentiment"] = df_fb["sentiment_label"].str.lower().str.strip()
+```
+**Cuándo reentrenar:** con ≥ 50 correcciones nuevas ya merece la pena.
+Con ≥ 200, el impacto en F1 suele ser medible (+0.01–0.03).
+        """)
+
+
 def grafico_sentimiento(df_res: pd.DataFrame):
     return px.pie(
         df_res, names="Sentimiento", title="Distribución de sentimiento",
@@ -690,7 +1191,33 @@ def mostrar_resultados(df_res: pd.DataFrame):
 
     st.subheader("📋 Tabla detallada")
     st.info("🔒 'Seudónimo' = SHA-256. Ningún nombre real en esta tabla ni en el CSV.")
-    st.dataframe(df_res, use_container_width=True)
+
+    # ── Feedback inline por fila ──────────────────────────────────
+    n_fb_open = st.session_state.get("_n_fb_open", 5)
+    mostrar_fb = st.toggle(
+        "✏️ Activar feedback por fila (marca si el modelo se equivocó)",
+        value=False,
+        help="Expande cada fila para corregir spam o sentimiento.",
+    )
+
+    if mostrar_fb:
+        st.caption(f"Mostrando las primeras {n_fb_open} filas con feedback. "
+                   "Ve a '📝 Feedback' para ver el historial completo.")
+        for idx, row in df_res.head(n_fb_open).iterrows():
+            texto_raw = row.get("Comentario", row.get("texto", ""))
+            pred_spam = "🚨 SÍ" if row.get("Spam","") == "🚨 SÍ" else "✅ NO"
+            pred_sent = str(row.get("Sentimiento",""))
+            etiq = f"{pred_spam} · {pred_sent}"
+            with st.expander(f"Fila {idx+1} — {str(texto_raw)[:80]}… — predicción: {etiq}"):
+                widget_feedback_fila(idx, str(texto_raw), pred_spam, pred_sent)
+
+        if len(df_res) > n_fb_open:
+            if st.button(f"Cargar {min(20, len(df_res)-n_fb_open)} filas más"):
+                st.session_state["_n_fb_open"] = n_fb_open + 20
+                st.rerun()
+    else:
+        st.dataframe(df_res, use_container_width=True)
+
     st.download_button("📥 Descargar CSV anonimizado", df_res.to_csv(index=False).encode("utf-8"), "auditoria_anonimizada.csv", "text/csv")
 
 
@@ -705,6 +1232,18 @@ AVISO_RGPD = """
 - **Base jurídica**: interés legítimo para moderación (Art. 6.1.f)
 - El CSV exportado no contiene nombres reales
 """
+
+
+# ─────────────────────────────────────────────────────────────────
+# FEEDBACK HUMANO — ruta del CSV de correcciones
+# ─────────────────────────────────────────────────────────────────
+FEEDBACK_CSV = "feedback_correcciones.csv"
+_FEEDBACK_COLS = [
+    "timestamp", "texto_hash", "texto",
+    "pred_spam", "pred_sentimiento",
+    "correcto_spam", "correcto_sentimiento",
+    "nota",
+]
 
 # ─────────────────────────────────────────────────────────────────
 # APP PRINCIPAL
@@ -747,6 +1286,8 @@ def main():
             "🎬 Auditoría en tiempo real",
             "📊 Rendimiento de los modelos",
             "📈 Datasets de entrenamiento",
+            "🧩 Análisis de temas",
+            "📝 Feedback & reentrenamiento",
         ])
         st.divider()
 
@@ -795,6 +1336,14 @@ def main():
             st.session_state["_ratio_sent_sel"] = ratio_sent_sel
             cargar_datos_sentimiento.clear()
             entrenar_sentimiento.clear()
+
+        # Indicador BERT
+        if HF_SENTIMENT_MODEL and _BERT_AVAILABLE:
+            st.success(f"🤖 BERT activo: `{HF_SENTIMENT_MODEL}`")
+        elif HF_SENTIMENT_MODEL and not _BERT_AVAILABLE:
+            st.warning("⚠️ `transformers` no instalado — usando sklearn")
+        else:
+            st.info("💡 **Activa BERT:** añade tu repo HF en `HF_SENTIMENT_MODEL`")
         n_neg_sent = 3810
         n_otras = min(n_neg_sent * ratio_sent_sel, 18210)
         st.caption(
@@ -825,6 +1374,21 @@ def main():
         with st.expander("📋 Aviso RGPD"):
             st.markdown(AVISO_RGPD)
 
+        # ── Badge de feedback acumulado ───────────────────────────
+        df_fb_side = leer_feedback()
+        if not df_fb_side.empty:
+            n_fb = len(df_fb_side)
+            n_err = ((df_fb_side["pred_spam"] != df_fb_side["correcto_spam"]) |
+                     (df_fb_side["pred_sentimiento"] != df_fb_side["correcto_sentimiento"])).sum()
+            st.markdown(
+                f'<div style="background:var(--color-background-warning);'
+                f'border:1px solid var(--color-border-warning);border-radius:8px;'
+                f'padding:8px 12px;font-size:12px;">'
+                f'✏️ <b>{n_fb}</b> feedbacks · <b>{n_err}</b> errores marcados<br>'
+                f'<span style="color:var(--color-text-secondary)">Ve a 📝 Feedback</span></div>',
+                unsafe_allow_html=True,
+            )
+
     # ════════════════════════════════════════════════════════════
     # A) ANÁLISIS MANUAL
     # ════════════════════════════════════════════════════════════
@@ -851,6 +1415,10 @@ def main():
                 for n, v in zip(nms, vals):
                     st.write(f"**{n}**: {v:.3f}")
 
+            with st.expander("✏️ ¿Se equivocó el modelo? Deja feedback"):
+                pred_spam_m = "🚨 SÍ" if res["spam"] else "✅ NO"
+                widget_feedback_fila(0, texto, pred_spam_m, res["sentimiento"])
+
     # ════════════════════════════════════════════════════════════
     # B) ANÁLISIS POR FICHERO
     # ════════════════════════════════════════════════════════════
@@ -870,7 +1438,9 @@ def main():
                 comentarios = df_up[["seudónimo", "texto"]].to_dict("records")
                 filas = analizar_batch(comentarios, spam_pipe, sent_pipe)
 
-            mostrar_resultados(pd.DataFrame(filas))
+            df_filas = pd.DataFrame(filas)
+            st.session_state["df_resultados_temas"] = df_filas
+            mostrar_resultados(df_filas)
 
     # ════════════════════════════════════════════════════════════
     # C) AUDITORÍA EN TIEMPO REAL
@@ -903,7 +1473,9 @@ def main():
             with st.spinner(f"Analizando {len(comentarios)} comentarios…"):
                 filas = analizar_batch(comentarios, spam_pipe, sent_pipe)
 
-            mostrar_resultados(pd.DataFrame(filas))
+            df_filas = pd.DataFrame(filas)
+            st.session_state["df_resultados_temas"] = df_filas
+            mostrar_resultados(df_filas)
 
     # ════════════════════════════════════════════════════════════
     # D) RENDIMIENTO DE LOS MODELOS
@@ -1049,8 +1621,67 @@ def main():
                     color_discrete_map={"Positive":"#2ecc71", "Negative":"#e74c3c", "Neutral":"#95a5a6"}),
                     use_container_width=True)
 
+    # ════════════════════════════════════════════════════════════
+    # G) FEEDBACK & REENTRENAMIENTO
+    # ════════════════════════════════════════════════════════════
+    if opcion == "📝 Feedback & reentrenamiento":
+        mostrar_panel_feedback()
+
     st.divider()
-    st.caption("v8.7 · Ensemble LR+SVC spam (3 fuentes) · LR word+char+EDA sent · Undersampling 1:1/1:1:1 · RGPD Art. 25")
+    st.caption("v9.0 · Ensemble LR+SVC spam · LR/BERT sent · NMF temas · Feedback humano · RGPD Art. 25")
+
+    # ── Análisis de temas ─────────────────────────────────────────
+    if opcion == "🧩 Análisis de temas":
+        st.header("🧩 Análisis de temas")
+
+        # Check if there are already analysed results in session state
+        df_cached = st.session_state.get("df_resultados_temas", None)
+
+        st.info(
+            "Esta sección analiza **qué temas dominan** los comentarios positivos, "
+            "negativos y neutros. Primero analiza un vídeo o sube un CSV en otra pestaña, "
+            "o pega comentarios directamente aquí."
+        )
+
+        fuente = st.radio(
+            "Fuente de comentarios",
+            ["Pegar comentarios manualmente", "Usar último análisis de vídeo/CSV"],
+            horizontal=True,
+        )
+
+        if fuente == "Pegar comentarios manualmente":
+            raw = st.text_area(
+                "Pega aquí los comentarios (uno por línea)",
+                height=200,
+                placeholder="Este vídeo es increíble!\nMalo, no me gustó nada.\nInteresante perspectiva...",
+            )
+            if st.button("🔍 Analizar temas", type="primary") and raw.strip():
+                lineas = [l.strip() for l in raw.strip().split("\n") if l.strip()]
+                with st.spinner(f"Analizando {len(lineas)} comentarios…"):
+                    resultados = [analizar(c, spam_pipe, sent_pipe) for c in lineas]
+                df_man = pd.DataFrame({
+                    "Comentario": [r["comentario"] for r in resultados],
+                    "Sentimiento": [r["sentimiento"] for r in resultados],
+                    "Spam": [r.get("spam_label","No") for r in resultados],
+                })
+                st.session_state["df_resultados_temas"] = df_man
+                st.rerun()
+
+            if "df_resultados_temas" in st.session_state:
+                mostrar_analisis_temas(st.session_state["df_resultados_temas"])
+
+        else:
+            # Look for results from other sections
+            df_cached = st.session_state.get("df_resultados_temas", None)
+            if df_cached is not None and not df_cached.empty:
+                mostrar_analisis_temas(df_cached)
+            else:
+                st.warning(
+                    "No hay resultados previos. Analiza un vídeo en '🎬 Auditoría en tiempo real' "
+                    "o sube un CSV en '📂 Análisis por fichero' y vuelve aquí."
+                )
+
+
 
 if __name__ == "__main__":
     main()
